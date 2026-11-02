@@ -17,6 +17,24 @@
 
 只支持最近 2 个 minor 版本。
 
+## [Unreleased]
+
+### Fixed
+
+- **Claude Code 自适应思考的 effort 被整个丢弃**：对 Opus 4.7+ / Sonnet 5+ /
+  Haiku 5.5+ 这类"自适应推理"模型，Claude Code 不再发 `thinking.budget_tokens`，
+  改发 `thinking: {type: "adaptive"}` + `output_config.effort`。桥原先只认
+  `thinking.type === 'enabled'`，两个条件都不满足，effort 被静默丢掉 ——
+  用户在 `/effort` 或 settings.json 的 `modelSettings` 里设什么，上游都收不到，
+  请求按上游默认思考量执行。现在直传 `output_config.effort`，并沿用实测表校验
+  （模型实测不收该档位时不下发，而不是让上游 400）。
+  抓包实证（真实 Claude Code 会话，`/v1/messages`）：
+
+  ```json
+  {"model":"claude-opus-5-5","thinking":{"type":"adaptive","display":"updates"},
+   "output_config":{"effort":"medium"},"max_tokens":128000}
+  ```
+
 ## [1.21.0] - 2026-10-31
 
 这次发布把 **1.20.0 之后累积的桥 / 接入缺陷修复**，与控制台、dsh 插件的一轮动效 / 交互细化

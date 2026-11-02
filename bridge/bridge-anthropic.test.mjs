@@ -74,14 +74,30 @@ const upstream = createServer((req, res) => {
            * `maxInputTokens` 是真实上限 1M，`contextWindow.defaultLength` 是官方
            * 默认档 300K：两者不同正是「客户端要 1M 却被报 300K」的来源。
            */
-          models: [{
-            id: 'deepseek-v4.1-flash',
-            name: 'DeepSeek-V4.1-Flash',
-            maxInputTokens: 1000000,
-            maxOutputTokens: 128000,
-            supportsToolCall: true,
-            contextWindow: { defaultLength: 300000, supportedLengths: [300000, 600000, 1000000] },
-          }],
+          models: [
+            {
+              id: 'deepseek-v4.1-flash',
+              name: 'DeepSeek-V4.1-Flash',
+              maxInputTokens: 1000000,
+              maxOutputTokens: 128000,
+              supportsToolCall: true,
+              contextWindow: { defaultLength: 300000, supportedLengths: [300000, 600000, 1000000] },
+            },
+            /*
+             * 专门给「实测表里是显式空数组」那条用例用：`glm-5.0` 在
+             * `REASONING_EFFORTS_BY_MODEL` 里是 `[]`（网关不接，一档不收），
+             * 且不匹配任何客户端别名正则，会原样成为上游收到的 model ——
+             * 这正是验证「不支持就不下发」所需的真实形状。
+             */
+            {
+              id: 'glm-5.0',
+              name: 'GLM-5.0',
+              maxInputTokens: 200000,
+              maxOutputTokens: 8192,
+              supportsToolCall: true,
+              supportsReasoning: true,
+            },
+          ],
         },
       }));
       return;
@@ -641,6 +657,86 @@ test('上游 401：Anthropic 路径回 502 + authentication_error，并提示重
   assert.equal(j.error.type, 'authentication_error');
   assert.match(j.error.message, /upstream login expired/i);
   assert.match(j.error.message, /upstream says no/, '上游原始 msg 仍应保留用于排查');
+});
+
+/*
+ * 自适应思考的 effort 直传（2026-11-02 实测暴露）。
+ *
+ * Claude Code 对 Opus 4.7+ / Sonnet 5+ / Haiku 5.5+ 这类"自适应推理"模型
+ * **不再发 `budget_tokens`**，而是发：
+ *
+ *   thinking: { type: 'adaptive', display: 'updates' }
+ *   output_config: { effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' }
+ *
+ * 桥原先只认 `thinking.type === 'enabled'` 那一个分支，上面两个条件都不满足，
+ * effort 被**整个丢掉** —— 用户在 `/effort` 或 settings.json 里设什么，上游
+ * 都收不到，请求静默按上游默认思考量执行。抓包实证（真实 Claude Code 会话）：
+ *
+ *   {"model":"claude-opus-5-5","thinking":{"type":"adaptive","display":"updates"},
+ *    "output_config":{"effort":"medium"},"max_tokens":128000}
+ *
+ * 下面三条钉住修复：能直传、不越俎代庖盖掉 budget 路径、不支持的值不下发。
+ */
+const askEffort = (effort, model = 'glm-5.3') => fetch(`${BASE}/v1/messages`, {
+  method: 'POST',
+  headers: { 'x-api-key': TOKEN, 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+  body: JSON.stringify({
+    model,
+    max_tokens: 64,
+    thinking: { type: 'adaptive', display: 'updates' },
+    output_config: { effort },
+    messages: [{ role: 'user', content: 'hi' }],
+  }),
+});
+
+test('Anthropic 自适应思考：output_config.effort 直传上游 reasoning_effort', async () => {
+  await waitReady();
+  scenario = { kind: 'text' };
+  for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+    lastUpstreamBody = null;
+    const res = await askEffort(effort);
+    assert.equal(res.status, 200);
+    await res.text();
+    assert.ok(lastUpstreamBody, `effort=${effort} 应当转发到上游`);
+    assert.equal(lastUpstreamBody.reasoning_effort, effort,
+      `客户端给的 effort 必须原样到达上游（实际 ${lastUpstreamBody.reasoning_effort}）`);
+  }
+});
+
+test('Anthropic 自适应思考：实测表外的档位不下发，避免上游 400', async () => {
+  await waitReady();
+  scenario = { kind: 'text' };
+  lastUpstreamBody = null;
+  // `glm-5.0` 在实测表里是**显式空数组**（网关不接，见 REASONING_EFFORTS_BY_MODEL）。
+  // 不用 `claude-haiku-4.5`：那个名字会先被 fast 别名正则命中，映射成别的模型，
+  // 测的就不是这条路径了。
+  const res = await askEffort('high', 'glm-5.0');
+  assert.equal(res.status, 200);
+  await res.text();
+  assert.ok(lastUpstreamBody);
+  assert.equal('reasoning_effort' in lastUpstreamBody, false,
+    '该模型实测一档不收 → 不能把 effort 塞给上游');
+});
+
+test('Anthropic 自适应思考：无 output_config 时不臆造 reasoning_effort', async () => {
+  await waitReady();
+  scenario = { kind: 'text' };
+  lastUpstreamBody = null;
+  const res = await fetch(`${BASE}/v1/messages`, {
+    method: 'POST',
+    headers: { 'x-api-key': TOKEN, 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: 'glm-5.3',
+      max_tokens: 64,
+      thinking: { type: 'adaptive' },
+      messages: [{ role: 'user', content: 'hi' }],
+    }),
+  });
+  assert.equal(res.status, 200);
+  await res.text();
+  assert.ok(lastUpstreamBody);
+  assert.equal('reasoning_effort' in lastUpstreamBody, false,
+    '客户端没说要哪个档位就不该替它选 —— 多开思考等于静默改行为');
 });
 
 // ── 收尾 ──────────────────────────────────────────────────────────────────

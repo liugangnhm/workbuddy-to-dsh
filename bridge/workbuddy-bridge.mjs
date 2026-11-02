@@ -12140,6 +12140,31 @@ async function handleRequest(req, res) {
         if (effort) oai.reasoning_effort = effort;
       }
       /*
+       * 自适应思考（`thinking.type: "adaptive"`）→ 上游 `reasoning_effort`：
+       *
+       * Claude Code 对 Opus 4.7+ / Sonnet 5+ / Haiku 5.5+ 这类"自适应推理"模型
+       * 不再发 `budget_tokens`，而是发 `thinking: {type:"adaptive"}` +
+       * `output_config.effort: "low|medium|high|xhigh|max"`。上面的 enabled 分支
+       * 两个条件都不满足，effort 会被整个丢掉 —— 用户在 `/effort` 或
+       * settings.json 里设什么，上游都收不到，请求静默按上游默认思考量执行。
+       *
+       * 直传而不是再走预算反推：客户端给的就是上游要的同一个档位名。
+       * 仍按实测表校验（与下方 `drop unsupported reasoning_effort` 同纪律）：
+       * 客户端给了该模型实测不收的值时不下发，而不是让上游 400。
+       */
+      if (!oai.reasoning_effort
+        && body.output_config && typeof body.output_config === 'object'
+        && typeof body.output_config.effort === 'string') {
+        const direct = body.output_config.effort.trim();
+        const measured = REASONING_EFFORTS_BY_MODEL[model];
+        if (KNOWN_REASONING_EFFORTS.includes(direct)
+          && Array.isArray(measured) && measured.includes(direct)) {
+          oai.reasoning_effort = direct;
+        } else if (direct) {
+          log('drop unsupported output_config.effort', `model=${model} effort=${direct} (measured: ${Array.isArray(measured) ? measured.join('/') || 'none' : 'unknown'})`);
+        }
+      }
+      /*
        * 输出上限按模型能力收敛：Claude Code 按自己的假设窗口算 max_tokens，
        * 可能超过该模型的上限，上游会直接 400。收敛并留痕（与 OpenAI 路径
        * `max_completion_tokens` 的处理同纪律）。
